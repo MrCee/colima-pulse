@@ -1,0 +1,34 @@
+# -----------------------------------------------------------------------------
+# Colima Pulse — public repo hygiene
+# -----------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+
+# Local env (never commit secrets or machine identity)
+.env
+.env.*
+!/.env.example
+
+# Local-only helper scripts (you still run them, but they are not published)
+publish_github.sh
+init_repo.sh
+
+# Backups / artifacts
+backups/
+*.tar.gz
+*.log
+*.tmp
+*.swp
+*.bak
+*.bak.*
+
+# Container topology is local-only by default.
+# Keep documentation + safe examples only.
+/containers/*
+!/containers/README.md
+!/containers/*.example.sh
+publish_github.sh
+init_repo.sh
+publish_github.sh
+init_repo.sh
