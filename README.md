@@ -1,413 +1,422 @@
 # 🚀 Colima Pulse
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![PRs: welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
-![Fixes: %2325](https://img.shields.io/badge/Fixes-%2325-6f42c1.svg)
-![Last commit](https://img.shields.io/github/last-commit/MrCee/colima-pulse.svg)
-![Platform: macOS](https://img.shields.io/badge/Platform-macOS-black.svg)
-![Architecture: x86_64 | ARM64](https://img.shields.io/badge/Architecture-x86__64%20%7C%20ARM64-2f81f7.svg)
-
-**🧱 Boot-level Docker infrastructure for macOS** — *pre-login • deterministic • supervised*  
+**Deterministic Docker Infrastructure for macOS**  
 *Colima • QEMU • LaunchDaemon • Terminal-first • Zero drift*
 
----
+<div align="left">
 
-## 🧠 What is Colima Pulse?
+![Platform](https://img.shields.io/badge/platform-macOS-black)
+![Arch](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)
+![VM](https://img.shields.io/badge/vm-QEMU-purple)
+![Runtime](https://img.shields.io/badge/runtime-Docker-2496ED)
+![Supervisor](https://img.shields.io/badge/supervisor-launchd-orange)
+![Goal](https://img.shields.io/badge/goal-sessionless%20Docker%20readiness-success)
 
-Colima Pulse turns Colima into **boot-level Docker infrastructure** on macOS.
-
-It does not “start Docker”.
-
-It **provisions**, **verifies**, **supervises**, and **enforces** Docker — **before login, every time**.
-
-If you need Docker on macOS to behave like a server (reliably, after reboot, without a GUI), this is for you.
-
----
-
-## ✅ What you get (the practical benefits)
-
-- 🟢 **Pre-login containers on macOS** without Docker Desktop  
-  A **system LaunchDaemon** brings Colima up after boot (after disk unlock), not after a user session starts.
-
-- 🧰 **Launchd-correct supervision** (no PID mismatch)  
-  Colima runs as the supervised process (`exec ... --foreground`), not as a child of a wrapper shell.
-
-- 🧪 **Deterministic readiness gating**  
-  Socket presence ≠ Docker ready. Colima Pulse gates on **docker.sock + Docker API + stability threshold** before doing anything operational.
-
-- 🧼 **Anti-drift controls (enforced, not suggested)**  
-  Prevents split-brain state (`~/.colima` vs XDG) and can remove conflicting Colima launchd services that cause dual-VM behaviour.
-
-- ♻️ **Idempotent, auditable container install pattern**  
-  `./containers/` is treated as **operational intent**: explicit scripts, sequential execution, clean reinstall behaviour.
-
-- 🧭 **Works on Intel and Apple Silicon**  
-  Auto-detects architecture and uses the correct Homebrew prefix (`/usr/local` vs `/opt/homebrew`).
+</div>
 
 ---
 
-## 👥 Who this is for
+## 🎯 What this is
 
-- 🍺 **Homebrew admins** who want Docker as an always-on capability, not a desktop workflow  
-- 🏠 **Homelab operators** running reverse proxies, VPN connectors, automations, and self-hosted services  
-- 🔧 Developers who want **repeatability and recovery**, not “it worked until reboot”  
-- 🧱 Anyone treating macOS like a small server that must boot cleanly and run headless
+**Colima Pulse** is a hardened, reproducible way to bring up **Docker on macOS** using:
+
+- **Colima** (VM wrapper)
+- **QEMU** (forced; never VZ)
+- **system `launchd` LaunchDaemon** supervision (boot domain; no GUI session required)
+- **deterministic health gates** (QEMU mode, sockets, Docker API readiness)
+- optional container “installers” for smoke-testing (e.g., `hello-world`)
+
+This is for machines where Docker should behave like **infrastructure**, not “whatever happens when I open Terminal”.
 
 ---
 
-## ⚡ Quickstart
+## ✅ Locked goals (do not relax)
+
+- **ALWAYS QEMU** (never VZ)
+- **Docker runtime**
+- **system LaunchDaemon** supervising `colima start --foreground`
+- **must run as `HOMEBREW_USER`** (via `su - USER -c ...`)
+- **deterministic startup gates**
+- **no-drift workflow** (scripted, inspectable, reproducible)
+
+---
+
+## ⚙️ Configuration model (SAFE by design)
+
+Colima Pulse splits configuration into two categories:
+
+### 1) Stable configuration (`.env`)
+`.env` is for **machine settings** that should be safe to keep around:
+
+- `HOMEBREW_USER` (required)
+- Colima profile and resource limits (`COLIMA_*`)
+- logging and launchd labels (`LABEL`, `LOG_PATH`)
+- prune preferences (`PRUNE_*`)
+- health gate timeouts (`WAIT_*`)
+- backup destination base path (used only when you explicitly run `--full-reset`)
+
+Think: *“how this machine should run every day.”*
+
+### 2) Dangerous / one-off actions (CLI flags)
+Anything that deletes or rewrites state is intentionally **opt-in at runtime**:
+
+- `--full-reset` (destructive reprovision)
+- `--backup=move|prompt|false` (how to handle existing state before deletion)
+- `--confirm-token=WORD` (interactive safety)
+- `--force-yes` (required for destructive non-interactive runs)
+
+Think: *“I am choosing to do something dangerous right now.”*
+
+#### Why “danger switches” are hard-coded in the script
+You will see defaults like this inside the script:
 
 ```bash
-cp .env.example .env
-# edit HOMEBREW_USER + resources (and optionally LABEL)
-zsh ./colima-pulse.sh
+# Enforce runtime model: danger switches are NOT allowed to be driven by .env
+FULL_RESET="false"
+FORCE_YES="false"
+RESET_REQUIRE_CONFIRM="true"
+RESET_CONFIRM_TOKEN="DESTROY"
+RESET_BACKUP_MODE="move"     # move|prompt|false
 ```
 
-Colima Pulse provisions Colima, installs a LaunchDaemon, verifies Docker is actually ready, then runs your container installers.
+This is deliberate:
+
+- It prevents a cloned repo (or a copied `.env`) from accidentally becoming destructive.
+- It ensures **restart-only is always the default** unless the operator explicitly passes flags.
+- It keeps `.env.example` truly **safe** for public sharing.
+- It makes “danger” an explicit, auditable command-line decision (great for runbooks and CI).
+
+**Precedence rule:** CLI flags override these defaults for the current run.
 
 ---
 
-# 🔥 Philosophy
+## 🧭 The boot model at a glance
 
-> Reset with intent.  
-> Rebuild with certainty.  
-> Verify before trust.
+From cold boot to Docker-ready, Colima Pulse follows this lifecycle:
 
-**Correctness by construction.**
+```mermaid
+flowchart TD
+  A["0) Pre-flight audits/guards<br/>• env resolved<br/>• brew prefix + binaries<br/>• profile/paths validated"] --> 
+  B["1) launchd hygiene<br/>• remove conflicting jobs<br/>• ensure our job is clean"]
+  B --> C["2) process hygiene<br/>• TERM→KILL: colima/lima<br/>• QEMU cleanup"]
+  C --> D{"3) state decision<br/>restart-only vs full-reset"}
+  D -->|restart-only| E["4) provisioning start<br/>• one-time colima start<br/>• enforce runtime=docker<br/>• enforce vm=qemu"]
+  D -->|full-reset| E
+  E --> F["5) health gates<br/>• wait socket<br/>• verify QEMU<br/>• wait Docker API<br/>• stability window"]
+  F --> G["6) launchd supervision<br/>• install LaunchDaemon<br/>• colima start --foreground<br/>• keepalive"]
+  G --> H["7) optional: container installs<br/>• hello-world smoke test"]
+```
 
-No drift.  
-No hidden state.  
-No silent fallback.  
-No GUI coupling.  
-No session dependency.
-
-**Infrastructure must boot. Not wait.**
-
----
-
-# 🏗 Architecture overview
-
-Colima Pulse enforces a strict boot model:
+<details>
+<summary>ASCII version (terminal-friendly)</summary>
 
 ```text
-macOS boot
-   ↓
-System LaunchDaemon (pre-login)
-   ↓
-su - USER  (login-style environment)
-   ↓
-exec colima start --foreground  (supervised PID)
-   ↓
-QEMU VM boot
-   ↓
-Docker runtime init
-   ↓
-docker.sock exposed
-   ↓
-Docker API verified + stabilised
-   ↓
-Container installers executed (./containers)
+┌───────────────────────────────────────────────────────────────────────┐
+│                         Colima Pulse lifecycle                         │
+└───────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│ 0) Pre-flight audits/guards  │
+│   - env resolved             │
+│   - brew prefix + binaries   │
+│   - profile/paths validated  │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 1) launchd hygiene           │
+│   - remove conflicting jobs  │
+│   - ensure our job is clean  │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 2) process hygiene           │
+│   - TERM→KILL: colima/lima   │
+│   - QEMU cleanup             │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 3) state decision            │
+│   - restart-only (default)   │
+│   - full-reset (destructive) │
+│     + optional backup modes  │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 4) provisioning start        │
+│   - one-time colima start    │
+│   - enforce: runtime=docker  │
+│   - enforce: vm=qemu         │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 5) health gates              │
+│   - wait socket              │
+│   - verify QEMU              │
+│   - wait Docker API          │
+│   - stability window         │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 6) launchd supervision       │
+│   - install LaunchDaemon     │
+│   - run: colima --foreground │
+│   - keepalive                │
+└───────────────┬──────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│ 7) optional: containers      │
+│   - hello-world smoke test   │
+└──────────────────────────────┘
 ```
+
+</details>
 
 ---
 
-## 🧠 Why LaunchDaemon + `su -` + `exec`?
+## 🧠 Why QEMU (not VZ)
 
-A LaunchDaemon runs in the **system domain** (exactly what we want for pre-login infrastructure), but it does **not** create a normal login environment.
+On Apple Silicon, macOS Virtualization.framework (“VZ”) can be fast for interactive dev, but Colima Pulse optimizes for **boot/session determinism**, not peak performance.
 
-Colima/Lima expect correct user context:
-
-- 🏠 HOME + ownership
-- 🧭 login-style environment
-- 🧩 predictable paths
-- 🧼 no XDG drift
-
-So the LaunchDaemon runs Colima like this:
-
-```sh
-/usr/bin/su - USER -c "unset XDG_CONFIG_HOME; export HOME=...; exec colima start --foreground"
-```
-
-✅ `su - USER` → login-style environment for the correct user  
-✅ `unset XDG_CONFIG_HOME` → prevents config/state drift into XDG locations  
-✅ `export HOME=...` → ensures state lives where expected  
-✅ `exec ... --foreground` → Colima becomes the supervised PID (no shell babysitting)
-
-**Result:** Docker-capable infrastructure can be **up at boot**, not after you log in.
+Colima Pulse chooses:
+- ✅ **QEMU + system LaunchDaemon supervision** (consistent “no GUI session required” behavior)
+- ❌ not VZ (even if faster), because determinism > speed
 
 ---
 
-# ⚠️ Critical decision: QEMU vs VZ (Apple Silicon)
+## 🔐 FileVault and unattended reboots (important)
 
-Colima supports two VM backends on Apple Silicon:
+FileVault encrypts the startup disk at rest. On macOS, **after a reboot the disk must be unlocked** before user home directories (`/Users/...`) are available.
 
+**What this means for Colima Pulse:**
+- Colima Pulse can run without a logged-in user, but it still relies on the target user’s home directory (Colima state under `~/.colima`, configs/log paths).
+- If FileVault is enabled and the Mac has just rebooted, **LaunchDaemons may start, but they cannot fully bring Colima up until the disk is unlocked at least once.**
+- After the first unlock following boot, Colima Pulse can run without a user session (logged out is fine) and keep containers alive across logouts.
+
+### ✅ Practical outcomes
+- **FileVault ON + normal reboot:** containers are **not guaranteed** to start until someone unlocks the disk once.
+- **FileVault OFF:** containers can start **fully unattended after reboot** (subject to power/network).
+- This is not “QEMU vs VZ”. It’s **boot-time disk unlock determinism**.
+
+### If your goal is: “After any reboot, containers must come back without a human”
+Pick one:
+1) Disable FileVault on the host running Colima Pulse (maximum unattended determinism)  
+2) Keep FileVault enabled, but accept: a human must unlock the disk after reboot  
+3) Use enterprise-managed “authorized restart / management tooling” (managed environments)
+
+---
+
+## 📦 What’s in this repo
+
+- `colima-pulse.sh` — canonical bootstrap/provision/supervise script
+- `.env.example` — safe template (copy to `.env`)
+- `containers/` — local installer drop-zone + safe examples/docs (`containers/README.md`)
+
+---
+
+## ✅ Requirements
+
+- macOS (Intel or Apple Silicon)
+- Homebrew installed  
+  - Apple Silicon: `/opt/homebrew`  
+  - Intel: `/usr/local`
+- Admin rights (system LaunchDaemon install)
+
+---
+
+## 🧰 Install (Homebrew deps)
+
+Colima Pulse expects these tools to exist (via Homebrew), and will install missing ones automatically:
+
+- `colima`
+- `docker`
 - `qemu`
-- `vz` (Apple Virtualization.framework)
 
-VZ is fast and deeply integrated — great for **interactive development**.
-
-Colima Pulse targets a different problem: **pre-login reliability under system supervision**.
-
-✅ **We’re optimising for infrastructure that boots cleanly and recovers predictably under `launchd`.**
-
----
-
-## 🔒 Why Colima Pulse enforces QEMU
-
-For boot-level supervision you want:
-
-- 🧱 stable behaviour under `/Library/LaunchDaemons`
-- 🔁 predictable lifecycle semantics under `launchd`
-- 🚫 no dependency on a GUI/session bootstrap
-- 🧪 repeatable cold-boot behaviour
-
-QEMU consistently meets these constraints on macOS because it runs in userspace and behaves predictably under system supervision.
-
-VZ can be excellent on a logged-in desktop, but for boot-level infrastructure it can introduce avoidable lifecycle ambiguity. Colima Pulse treats that ambiguity as a failure mode.
-
-So:
-
-- ✅ **QEMU is mandatory**
-- ❌ **VZ is explicitly rejected**
-- 🧨 If VZ is detected, Colima Pulse fails loudly
+### Recommended (normal path)
+1) Make the script executable (first time only)
+2) Run it — it will detect Homebrew prefix, check dependencies, and install anything missing
 
 ```bash
-COLIMA_VM_TYPE=qemu
+chmod +x ./colima-pulse.sh
+./colima-pulse.sh
 ```
 
----
-
-## 🔐 FileVault note
-
-FileVault encrypts the disk at rest.
-
-Until a user unlocks the disk at boot, user home directories are unavailable — this affects *everything*. After unlock, Colima Pulse can run pre-login as designed.
-
-The distinction here is not encryption; it’s **launchd/session determinism**.
-
----
-
-# ⚙️ What the script does
-
-Run:
+### Manual install (optional)
+If you prefer installing prerequisites yourself:
 
 ```bash
-zsh ./colima-pulse.sh
+brew install colima docker qemu
 ```
 
-Colima Pulse performs these phases:
+> Note: QEMU is mandatory for Colima Pulse because the runtime model is **QEMU-only** (never VZ).
 
 ---
 
-## 🔥 1) Guarded reset (optional)
+## ⚙️ Setup (.env)
 
-If:
-
-```bash
-FULL_RESET=true
-```
-
-It performs a guarded “nuclear reset”:
-
-- 🛑 stops Colima
-- 🧹 deletes the profile
-- 🧨 removes state directories (both potential locations to prevent dual-state drift)
-- 🧯 removes the LaunchDaemon
-- 🧱 rebuilds from zero
-
-No incremental patching.  
-No drift accumulation.
-
----
-
-## 🧱 2) Deterministic provisioning
-
-- 🧰 provisions a fresh VM (**QEMU only**)
-- 🧪 verifies VM backend (fails if VZ appears)
-- ✅ brings up Docker socket + API cleanly
-
----
-
-## 🖥 3) Supervised system LaunchDaemon
-
-Installs:
-
-```text
-/Library/LaunchDaemons/<LABEL>.plist
-```
-
-Then bootstraps + kickstarts it.
-
-The daemon becomes the **authoritative owner** of the Colima lifecycle.
-
----
-
-## ⏳ 4) Deterministic readiness gates
-
-The script waits for:
-
-- 🔌 docker.sock presence
-- 🧠 Docker API responsiveness
-- 🧱 stability threshold (multiple consecutive successful checks)
-
-No silent hangs.  
-Hard timeouts.  
-Fail-fast.
-
----
-
-## ▶️ 5) Container installers
-
-Once Docker is stable, the script runs installer files from:
-
-```text
-./containers/
-```
-
----
-
-# 📦 About `containers/`
-
-The `containers/` directory is intentionally **simple and explicit**.
-
-Each file is an executable script containing a `docker run ...` command. Colima Pulse treats this directory as **operational intent**:
-
-- 🧾 scripts run **sequentially**
-- ♻️ existing containers are removed first (idempotent reinstall)
-- 📺 output is streamed live
-- 🧨 failures stop the run (fail-fast)
-
-This design is deliberate: it’s easy to audit, easy to version, and easy to keep secrets out of Git.
-
----
-
-## 🤝 Why not Docker Compose?
-
-Compose is great — but it introduces orchestration semantics and lifecycle complexity.
-
-Colima Pulse keeps responsibilities separated:
-
-- 🧱 **LaunchDaemon** supervises the platform (Colima)
-- 📦 `containers/` declares what you want installed
-- 👀 you retain complete visibility into exactly what runs
-
-If you want Compose, you can still run it *inside* this model — but Colima Pulse itself stays lean and deterministic.
-
----
-
-## ✅ What belongs in `containers/`?
-
-Common examples:
-
-- 🌐 reverse proxy (Caddy / Traefik / Nginx)
-- 🔐 VPN connectors / sidecars
-- 🤖 automations / schedulers
-- 🏠 self-hosted services you want up at boot
-
-**Keep secrets out of the repo.** Prefer environment variables or local `.env` values.
-
----
-
-# 🔐 Configuration (`.env`)
-
-Copy the example:
+Copy and edit:
 
 ```bash
 cp .env.example .env
+$EDITOR .env
 ```
 
-Edit at minimum:
+Minimum required:
+- `HOMEBREW_USER`
 
-- 👤 `HOMEBREW_USER`
-- 🧠 `COLIMA_CPUS`, `COLIMA_MEMORY`, `COLIMA_DISK`
-- 🏷 `LABEL` (optional, but recommended to keep repo-canonical)
+Common tuning:
+- `COLIMA_PROFILE`, `COLIMA_CPUS`, `COLIMA_MEMORY`, `COLIMA_DISK`
+- `LABEL`, `LOG_PATH`
+- `BACKUP_DIR_BASE` (used only when you explicitly run `--full-reset`)
+- `PRUNE_DOCKER_AFTER_START`, `PRUNE_MODE`
+- `WAIT_SOCKET_MAX`, `WAIT_DOCKER_API_MAX`, `WAIT_QEMU_MAX`, `WAIT_STABLE_REQUIRED`
 
 ---
 
-# 📍 What changes on your system?
+## ▶️ Usage (copy/paste)
 
-Colima Pulse installs/uses:
+> Prefer `./colima-pulse.sh ...` (not `zsh ./...`) to avoid extra shells and keep TTY/stdout behavior predictable.
 
-- 🧾 **LaunchDaemon plist:** `/Library/LaunchDaemons/<LABEL>.plist`
-- 🪵 **Log file:** `/var/log/colima.log`
-- 🧊 **Colima state (forced):** `~/.colima/`
-
-It also enforces a deterministic lifecycle:
-
-- the daemon supervises Colima pre-login
-- Docker readiness is verified before installers run
-- optional “nuclear reset” wipes state and rebuilds cleanly
-
----
-
-# 🔎 Observability
-
-Log file:
-
-```text
-/var/log/colima.log
-```
-
-Useful checks:
-
+### Show help / options
 ```bash
-sudo launchctl print system/<LABEL>
-colima status --verbose
-docker version
-docker ps
+./colima-pulse.sh --help
+```
+
+### Restart-only (safe default)
+Keeps existing Colima state directories.
+```bash
+./colima-pulse.sh
+```
+
+### Full reset (destructive)
+Reprovisions Colima by deleting/rebuilding state (with safety confirmation).
+```bash
+./colima-pulse.sh --full-reset
+```
+
+### Full reset + choose backup behavior
+`--backup=move` is the default (recommended).
+```bash
+./colima-pulse.sh --full-reset --backup=move
+./colima-pulse.sh --full-reset --backup=prompt
+./colima-pulse.sh --full-reset --backup=false
+```
+
+### Full reset + custom confirmation token (interactive)
+Default token is `DESTROY`.
+```bash
+./colima-pulse.sh --full-reset --confirm-token=DESTROY
+```
+
+### Non-interactive destructive runs (launchd / CI / cron)
+`--force-yes` exists to allow `--full-reset` when there is **no TTY**.
+It does **not** mean “skip typed confirmation” in an interactive Terminal.
+```bash
+./colima-pulse.sh --full-reset --force-yes
+```
+
+### Optional: skip typed confirmation (only if supported by your script)
+If your `--help` output includes `--no-confirm`, you can use:
+```bash
+./colima-pulse.sh --full-reset --no-confirm
+# or (for non-interactive + no-confirm)
+./colima-pulse.sh --full-reset --force-yes --no-confirm
 ```
 
 ---
 
-# ❌ What this is not
+## 🧷 launchd supervision model
 
-Colima Pulse is not:
+Colima Pulse uses a **system LaunchDaemon** (system domain) to supervise:
 
-- Docker Desktop
-- Kubernetes
-- a GUI tool
-- a state-preserving patch layer
-- a general-purpose VM manager
+- `su - $HOMEBREW_USER -c "… colima start --foreground …"`
 
-It is intentionally opinionated.
+Why this model:
+- LaunchAgents require user login (not acceptable for sessionless Docker)
+- LaunchDaemons can start at boot, but must drop privileges to the Homebrew user so ownership, paths, and Colima state remain correct
 
-It optimises for determinism.
-
----
-
-# 🛡 Operational guarantees
-
-Colima Pulse enforces:
-
-- 🔒 QEMU only (no VZ drift)
-- 🧱 system LaunchDaemon supervision (pre-login)
-- 🎯 supervised PID lifecycle (`exec ... --foreground`)
-- ✅ deterministic readiness gating (no “maybe ready”)
-- ♻️ rebuild-over-patching when correctness matters
+Useful commands:
+```bash
+sudo launchctl print system | grep -i colima
+sudo launchctl print system/<LABEL>
+sudo launchctl kickstart -k system/<LABEL>
+sudo launchctl bootout system/<LABEL>
+```
 
 ---
 
-# 📌 Status
+## 🧪 Containers smoke test: hello-world
 
-- ✅ Architecture stable
-- ✅ LaunchDaemon model verified
-- ✅ Deterministic cold boot proven
-- ✅ QEMU enforced
-- ✅ Production-usable
+A minimal example container installer lives here:
 
----
+- `containers/hello-world/`
 
-# 🧨 Final word
-
-Colima Pulse does not patch problems.
-
-It removes ambiguity.
-
-It enforces correctness.
-
-It boots infrastructure, not convenience.
+Purpose:
+✅ validate end-to-end readiness:
+- Colima up
+- Docker socket ready
+- Docker API responding
+- pull/run works
 
 ---
 
-**Colima Pulse**  
-*Reset with intent. Rebuild with confidence.*
+## 🔒 containers/ security policy
+
+The `containers/` folder is local-by-default because real installers may include secrets.
+
+- The repo commits only documentation + sanitized examples/templates
+- Real installers remain local and should be git-ignored
+
+Authoritative policy:
+- `containers/README.md`
+
+---
+
+## 🧯 Troubleshooting
+
+Docker API readiness:
+```bash
+colima status
+docker context ls
+docker info
+```
+
+Not using QEMU:
+- check for profile overrides
+- check for competing system services
+
+Works after login but not after reboot:
+- read **FileVault and unattended reboots** above
+
+---
+
+## 🏷️ License
+
+MIT — see `LICENSE`
+
+---
+
+## 💬 The human bit (why this exists)
+
+Most macOS Docker setups are “good enough” until the day you actually need them to behave like infrastructure:
+
+- the machine reboots while you’re not there
+- the desktop session isn’t logged in
+- a daemon fights another daemon
+- Docker looks “up” but the API isn’t ready
+- something silently flips modes and your boot semantics change
+
+**Colima Pulse is the antidote.**
+
+It’s not trying to be clever.  
+It’s trying to be **boringly correct**.
+
+If you want a Mac that boots and quietly does its job —  
+**this is for you.**
