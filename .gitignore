@@ -25,10 +25,17 @@ backups/
 
 # Container topology is local-only by default.
 # Keep documentation + safe examples only.
-/containers/*
-!/containers/README.md
-!/containers/*.example.sh
-publish_github.sh
-init_repo.sh
-publish_github.sh
-init_repo.sh
+containers/*
+!containers/README.md
+!containers/hello-world
+
+
+# === Colima Pulse: containers/ secrets policy ===
+# Deny-by-default: treat containers/ as a local secrets drop-zone.
+containers/**
+
+# Allow safe, tracked docs/templates
+!containers/README.md
+!containers/example-*.sh
+!containers/template-*.sh
+# === end containers policy ===

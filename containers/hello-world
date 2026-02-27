@@ -1,0 +1,1 @@
+docker run --name colima-pulse-demo --rm hello-world
