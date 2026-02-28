@@ -788,7 +788,13 @@ kill_colima_stack() {
   uid="$(id -u "${HOMEBREW_USER}" 2>/dev/null || true)"
   [[ -n "${uid}" ]] || die "Could not resolve uid for ${HOMEBREW_USER}"
 
-  run_as_user "${COLIMA_BIN}" stop --profile "${COLIMA_PROFILE}" >/dev/null 2>&1 || true
+  dim "  - colima stop (timeout 25s, best-effort)..."
+  if ! /usr/bin/perl -e 'alarm shift; exec @ARGV' 25 \
+    sudo -u "${HOMEBREW_USER}" env -u XDG_CONFIG_HOME -u DOCKER_CONTEXT HOME="${HOMEBREW_USER_HOME}" \
+      PATH="$(dirname -- "${DOCKER_BIN}")":"$(dirname -- "${COLIMA_BIN}")":"${PATH}" \
+      "${COLIMA_BIN}" stop --profile "${COLIMA_PROFILE}" >/dev/null 2>&1; then
+    warn "  ⚠️ colima stop did not complete — continuing with pkill."
+  fi
 
   sudo pkill -TERM -u "${uid}" -f "${COLIMA_BIN} start"        >/dev/null 2>&1 || true
   sudo pkill -TERM -u "${uid}" -f "${COLIMA_BIN} daemon start" >/dev/null 2>&1 || true
@@ -799,28 +805,62 @@ kill_colima_stack() {
   sudo pkill -TERM -f "/usr/bin/su - ${HOMEBREW_USER} -c"      >/dev/null 2>&1 || true
 
   local i=0
+  local still_running=1
+
   while (( i < 8 )); do
     if ps aux | /usr/bin/grep -Ei 'colima start|colima daemon start|limactl|qemu-system|lima-colima|sshfs.*_lima' | /usr/bin/grep -v grep >/dev/null 2>&1; then
       sleep 1
       ((i++))
     else
-      ok "✅ No lingering colima/lima/qemu processes detected"
-      return 0
+      still_running=0
+      break
     fi
   done
 
-  warn "⚠️ Still running — escalating to KILL"
-  sudo pkill -KILL -u "${uid}" -f "${COLIMA_BIN} start"        >/dev/null 2>&1 || true
-  sudo pkill -KILL -u "${uid}" -f "${COLIMA_BIN} daemon start" >/dev/null 2>&1 || true
-  sudo pkill -KILL -u "${uid}" -f "limactl"                    >/dev/null 2>&1 || true
-  sudo pkill -KILL -u "${uid}" -f "qemu-system"                >/dev/null 2>&1 || true
-  sudo pkill -KILL -u "${uid}" -f "sshfs.*_lima"               >/dev/null 2>&1 || true
-  sudo pkill -KILL -u "${uid}" -f "ssh: .*_lima"               >/dev/null 2>&1 || true
-  sudo pkill -KILL -f "/usr/bin/su - ${HOMEBREW_USER} -c"      >/dev/null 2>&1 || true
+  if (( still_running == 1 )); then
+    warn "⚠️ Still running — escalating to KILL"
+    sudo pkill -KILL -u "${uid}" -f "${COLIMA_BIN} start"        >/dev/null 2>&1 || true
+    sudo pkill -KILL -u "${uid}" -f "${COLIMA_BIN} daemon start" >/dev/null 2>&1 || true
+    sudo pkill -KILL -u "${uid}" -f "limactl"                    >/dev/null 2>&1 || true
+    sudo pkill -KILL -u "${uid}" -f "qemu-system"                >/dev/null 2>&1 || true
+    sudo pkill -KILL -u "${uid}" -f "sshfs.*_lima"               >/dev/null 2>&1 || true
+    sudo pkill -KILL -u "${uid}" -f "ssh: .*_lima"               >/dev/null 2>&1 || true
+    sudo pkill -KILL -f "/usr/bin/su - ${HOMEBREW_USER} -c"      >/dev/null 2>&1 || true
 
-  sleep 1
-  if ps aux | /usr/bin/grep -Ei 'colima start|colima daemon start|limactl|qemu-system|lima-colima|sshfs.*_lima' | /usr/bin/grep -v grep >/dev/null 2>&1; then
-    die "Unable to fully stop Colima/Lima/QEMU. Reboot and re-run."
+    sleep 1
+    if ps aux | /usr/bin/grep -Ei 'colima start|colima daemon start|limactl|qemu-system|lima-colima|sshfs.*_lima' | /usr/bin/grep -v grep >/dev/null 2>&1; then
+      die "Unable to fully stop Colima/Lima/QEMU. Reboot and re-run."
+    fi
+  fi
+
+  # ------------------------------------------------------------------------------
+  # Settle barrier: prevent race where teardown continues AFTER processes disappear
+  # (socket + residual helpers can linger briefly)
+  # ------------------------------------------------------------------------------
+  local settle=0
+  local settle_max=45
+  step "▶ Settling teardown (wait up to ${settle_max}s)"
+  while (( settle < settle_max )); do
+    if ps aux | /usr/bin/grep -Ei 'colima start|colima daemon start|limactl|qemu-system|lima-colima|sshfs.*_lima' | /usr/bin/grep -v grep >/dev/null 2>&1; then
+      dim "  … still stopping processes (t=${settle}s)"
+      sleep 1
+      ((settle++))
+      continue
+    fi
+
+    if [[ -S "${COLIMA_SOCKET}" ]]; then
+      dim "  … socket still present (t=${settle}s)"
+      sleep 1
+      ((settle++))
+      continue
+    fi
+
+    ok "✅ Teardown settled"
+    break
+  done
+
+  if (( settle >= settle_max )); then
+    die "Teardown did not settle after ${settle_max}s (processes/socket linger). Reboot and re-run."
   fi
 
   ok "✅ Forced shutdown complete"
@@ -1520,11 +1560,54 @@ hr
 
 if [[ "${FULL_RESET:l}" == "true" ]]; then
   step "▶ Deleting profile ${COLIMA_PROFILE}"
-  run_as_user "${COLIMA_BIN}" delete --profile "${COLIMA_PROFILE}" -f >/dev/null 2>&1 || true
+  dim "  - colima delete (timeout 60s, best-effort)..."
+  if ! /usr/bin/perl -e 'alarm shift; exec @ARGV' 60 \
+    sudo -u "${HOMEBREW_USER}" env -u XDG_CONFIG_HOME -u DOCKER_CONTEXT HOME="${HOMEBREW_USER_HOME}" \
+      PATH="$(dirname -- "${DOCKER_BIN}")":"$(dirname -- "${COLIMA_BIN}")":"${PATH}" \
+      "${COLIMA_BIN}" delete --profile "${COLIMA_PROFILE}" -f >/dev/null 2>&1; then
+    warn "  ⚠️ colima delete did not complete — proceeding to purge dirs."
+  fi
 
   step "▶ Purging state dirs"
   run_as_user /bin/rm -rf "${HOMEBREW_USER_HOME}/.colima" >/dev/null 2>&1 || true
   run_as_user /bin/rm -rf "${HOMEBREW_USER_HOME}/.config/colima" >/dev/null 2>&1 || true
+
+  # ------------------------------------------------------------------------------
+  # Reinforced settle barrier AFTER delete+purge (prevents 1st-run races)
+  # ------------------------------------------------------------------------------
+  local settle=0
+  local settle_max=60
+  step "▶ Settling delete+purge (wait up to ${settle_max}s)"
+  while (( settle < settle_max )); do
+    if ps aux | /usr/bin/grep -Ei "colima start|colima daemon start|limactl|qemu-system|lima-colima|sshfs.*_lima" | /usr/bin/grep -v grep >/dev/null 2>&1; then
+      dim "  … lingering processes (t=${settle}s)"
+      sleep 1
+      ((settle++))
+      continue
+    fi
+
+    if [[ -S "${COLIMA_SOCKET}" ]]; then
+      dim "  … docker.sock still present (t=${settle}s)"
+      sleep 1
+      ((settle++))
+      continue
+    fi
+
+    if [[ -d "${HOMEBREW_USER_HOME}/.colima" || -d "${HOMEBREW_USER_HOME}/.config/colima" ]]; then
+      dim "  … state dirs still present (t=${settle}s)"
+      sleep 1
+      ((settle++))
+      continue
+    fi
+
+    ok "✅ Delete+purge settled"
+    break
+  done
+
+  if (( settle >= settle_max )); then
+    die "Delete+purge did not settle after ${settle_max}s (lingering teardown). Reboot and re-run."
+  fi
+
   hr
 else
   step "▶ FULL_RESET=false — keeping state dirs"
