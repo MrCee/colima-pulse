@@ -87,16 +87,14 @@ die() { print -r -- "❌ $*" >&2; exit 1; }
 supports_color() { [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; }
 typeset -g C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN=""
 if supports_color; then
-# --- Colors (portable: zsh + bash; safe on Intel + Apple Silicon) ---
-# Real ESC byte via ANSI-C quoting:
-C_ESC=$'\033'
-C_RESET="${C_ESC}[0m"
-C_BOLD="${C_ESC}[1m"
-C_DIM="${C_ESC}[2m"
-C_RED="${C_ESC}[31m"
-C_GREEN="${C_ESC}[32m"
-C_YELLOW="${C_ESC}[33m"
-C_CYAN="${C_ESC}[36m"
+  C_ESC=$'\033'
+  C_RESET="${C_ESC}[0m"
+  C_BOLD="${C_ESC}[1m"
+  C_DIM="${C_ESC}[2m"
+  C_RED="${C_ESC}[31m"
+  C_GREEN="${C_ESC}[32m"
+  C_YELLOW="${C_ESC}[33m"
+  C_CYAN="${C_ESC}[36m"
 fi
 
 step() { say "${C_BOLD}${C_CYAN}$*${C_RESET}"; }
@@ -341,7 +339,6 @@ warn_env_duplicates() {
   emulate -L zsh
   xtrace_off
 
-  # Only warn on stable keys (ones we actually accept from .env)
   local keys=(
     HOMEBREW_USER
     COLIMA_PROFILE COLIMA_RUNTIME COLIMA_VM_TYPE COLIMA_CPUS COLIMA_MEMORY COLIMA_DISK
@@ -557,7 +554,6 @@ xtrace_off
 
 # Append a block to LOG_PATH without polluting STDOUT (best effort).
 append_to_log_best_effort() {
-  # Reads stdin, appends into LOG_PATH.
   if /usr/bin/printf '' | sudo /usr/bin/tee -a "${LOG_PATH}" >/dev/null 2>&1; then
     sudo /usr/bin/tee -a "${LOG_PATH}" >/dev/null 2>&1 || true
     return 0
@@ -778,7 +774,7 @@ kickstart_daemon_best_effort() {
 }
 
 # ------------------------------------------------------------------------------
-# Kill stack (TERM -> KILL)
+# Kill stack (TERM -> KILL)  [MUST NEVER ABORT SCRIPT]
 # ------------------------------------------------------------------------------
 kill_colima_stack() {
   step "▶ Killing any existing colima/qemu (TERM → KILL)"
@@ -789,12 +785,12 @@ kill_colima_stack() {
   [[ -n "${uid}" ]] || die "Could not resolve uid for ${HOMEBREW_USER}"
 
   dim "  - colima stop (timeout 25s, best-effort)..."
-  if ! /usr/bin/perl -e 'alarm shift; exec @ARGV' 25 \
+  # IMPORTANT: MUST NOT abort under set -e. Mask failures unconditionally.
+  /usr/bin/perl -e 'alarm shift; exec @ARGV' 25 \
     sudo -u "${HOMEBREW_USER}" env -u XDG_CONFIG_HOME -u DOCKER_CONTEXT HOME="${HOMEBREW_USER_HOME}" \
       PATH="$(dirname -- "${DOCKER_BIN}")":"$(dirname -- "${COLIMA_BIN}")":"${PATH}" \
-      "${COLIMA_BIN}" stop --profile "${COLIMA_PROFILE}" >/dev/null 2>&1; then
-    warn "  ⚠️ colima stop did not complete — continuing with pkill."
-  fi
+      "${COLIMA_BIN}" stop --profile "${COLIMA_PROFILE}" >/dev/null 2>&1 \
+    || warn "  ⚠️ colima stop did not complete — continuing with pkill."
 
   sudo pkill -TERM -u "${uid}" -f "${COLIMA_BIN} start"        >/dev/null 2>&1 || true
   sudo pkill -TERM -u "${uid}" -f "${COLIMA_BIN} daemon start" >/dev/null 2>&1 || true
@@ -833,10 +829,7 @@ kill_colima_stack() {
     fi
   fi
 
-  # ------------------------------------------------------------------------------
-  # Settle barrier: prevent race where teardown continues AFTER processes disappear
-  # (socket + residual helpers can linger briefly)
-  # ------------------------------------------------------------------------------
+  # Settle barrier (same logic, unchanged)
   local settle=0
   local settle_max=45
   step "▶ Settling teardown (wait up to ${settle_max}s)"
@@ -1275,7 +1268,6 @@ colima_start_provisioning_quiet() {
   rc=$?
   set -e
 
-  # Always append FULL raw output into LOG_PATH for forensics.
   {
     echo "-------------------------------------------------------------------------------"
     echo "colima start raw output ($(date))"
@@ -1286,7 +1278,6 @@ colima_start_provisioning_quiet() {
     echo "-------------------------------------------------------------------------------"
   } | append_to_log_best_effort
 
-  # Terminal output: filtered (no time="..." level=info spam)
   if [[ "${COLIMA_START_FILTER_INFO:l}" == "true" ]]; then
     if is_tty && [[ -w /dev/tty ]]; then
       /usr/bin/grep -Ev '^time="[^"]+" level=info ' "${tmp}" > /dev/tty || true
@@ -1346,7 +1337,6 @@ extract_container_name() {
 
 is_transient_docker_error() {
   local text="$1"
-  # Treat ANY EOF as transient for Colima VM docker socket flakiness.
   print -r -- "${text}" | /usr/bin/grep -Eqi \
     '(_ping.*EOF|\bEOF\b|context canceled|client connection is closing|connection reset by peer|broken pipe|i/o timeout|TLS handshake timeout|unexpected EOF|http2:.*stream|net/http: TLS handshake timeout|connection refused|no such file or directory)'
 }
@@ -1501,7 +1491,7 @@ print_docker_ps_summary() {
 }
 
 # ------------------------------------------------------------------------------
-# Nuclear guard
+# Nuclear guard (NOW ONLY GUARDS; DOES NOT MOVE STATE)
 # ------------------------------------------------------------------------------
 guard_nuclear_reset() {
   if [[ "${FULL_RESET:l}" != "true" ]]; then
@@ -1524,8 +1514,6 @@ guard_nuclear_reset() {
   if ! is_tty && [[ "${FORCE_YES:l}" != "true" ]]; then
     die "--full-reset in non-interactive mode is refused without --force-yes."
   fi
-
-  maybe_backup_state
 
   if [[ "${RESET_REQUIRE_CONFIRM:l}" == "true" ]]; then
     if [[ "${FORCE_YES:l}" == "true" && ! is_tty ]]; then
@@ -1555,26 +1543,31 @@ daemon_bootout_remove_if_present
 sudo rm -f "${PLIST_PATH}" >/dev/null 2>&1 || true
 hr
 
+# ------------------------------------------------------------------------------
+# CRITICAL REORDER:
+#   Stop/kill FIRST (so colima stop can still see its state),
+#   then move/backup state (if FULL_RESET),
+#   then delete/purge.
+# ------------------------------------------------------------------------------
 kill_colima_stack
 hr
 
 if [[ "${FULL_RESET:l}" == "true" ]]; then
+  # Move state AFTER we've stopped everything (prevents stop failures / first-run abort)
+  maybe_backup_state
+
   step "▶ Deleting profile ${COLIMA_PROFILE}"
   dim "  - colima delete (timeout 60s, best-effort)..."
-  if ! /usr/bin/perl -e 'alarm shift; exec @ARGV' 60 \
+  /usr/bin/perl -e 'alarm shift; exec @ARGV' 60 \
     sudo -u "${HOMEBREW_USER}" env -u XDG_CONFIG_HOME -u DOCKER_CONTEXT HOME="${HOMEBREW_USER_HOME}" \
       PATH="$(dirname -- "${DOCKER_BIN}")":"$(dirname -- "${COLIMA_BIN}")":"${PATH}" \
-      "${COLIMA_BIN}" delete --profile "${COLIMA_PROFILE}" -f >/dev/null 2>&1; then
-    warn "  ⚠️ colima delete did not complete — proceeding to purge dirs."
-  fi
+      "${COLIMA_BIN}" delete --profile "${COLIMA_PROFILE}" -f >/dev/null 2>&1 \
+    || warn "  ⚠️ colima delete did not complete — proceeding to purge dirs."
 
   step "▶ Purging state dirs"
   run_as_user /bin/rm -rf "${HOMEBREW_USER_HOME}/.colima" >/dev/null 2>&1 || true
   run_as_user /bin/rm -rf "${HOMEBREW_USER_HOME}/.config/colima" >/dev/null 2>&1 || true
 
-  # ------------------------------------------------------------------------------
-  # Reinforced settle barrier AFTER delete+purge (prevents 1st-run races)
-  # ------------------------------------------------------------------------------
   local settle=0
   local settle_max=60
   step "▶ Settling delete+purge (wait up to ${settle_max}s)"
@@ -1643,3 +1636,5 @@ echo "==========================================================================
 ok "✅ SUCCESS — QEMU enforced, daemon supervised, Docker stable, containers installed cleanly."
 echo "================================================================================"
 echo ""
+
+
