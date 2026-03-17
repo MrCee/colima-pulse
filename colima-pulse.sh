@@ -465,6 +465,24 @@ docker_as_user() {
   run_as_user "${DOCKER_BIN}" --host="${DOCKER_HOST_URI}" "$@"
 }
 
+remove_stale_socket() {
+  emulate -L zsh
+  xtrace_off
+
+  # If the socket path exists (socket or any leftover file), remove it.
+  # Safe when Colima/Lima/QEMU are not running; next start recreates it.
+  if [[ -S "${COLIMA_SOCKET}" || -e "${COLIMA_SOCKET}" ]]; then
+    warn "  ⚠️ Removing stale docker.sock: ${COLIMA_SOCKET}"
+    run_as_user /bin/rm -f "${COLIMA_SOCKET}" >/dev/null 2>&1 || true
+
+    # If the profile dir is now empty, remove it too (best-effort).
+    run_as_user /bin/rmdir "${HOMEBREW_USER_HOME}/.colima/${COLIMA_PROFILE}" >/dev/null 2>&1 || true
+  fi
+
+  return 0
+}
+
+
 # Prefer profile-aware ssh, but gracefully fall back if --profile unsupported.
 colima_ssh_as_user() {
   local out rc
@@ -842,7 +860,8 @@ kill_colima_stack() {
     fi
 
     if [[ -S "${COLIMA_SOCKET}" ]]; then
-      dim "  … socket still present (t=${settle}s)"
+      dim "  … socket still present (t=${settle}s) — removing stale socket"
+      remove_stale_socket || true
       sleep 1
       ((settle++))
       continue
@@ -1580,12 +1599,13 @@ if [[ "${FULL_RESET:l}" == "true" ]]; then
     fi
 
     if [[ -S "${COLIMA_SOCKET}" ]]; then
-      dim "  … docker.sock still present (t=${settle}s)"
+      dim "  … docker.sock still present (t=${settle}s) — removing stale socket"
+      remove_stale_socket || true
       sleep 1
       ((settle++))
       continue
     fi
-
+	
     if [[ -d "${HOMEBREW_USER_HOME}/.colima" || -d "${HOMEBREW_USER_HOME}/.config/colima" ]]; then
       dim "  … state dirs still present (t=${settle}s)"
       sleep 1
